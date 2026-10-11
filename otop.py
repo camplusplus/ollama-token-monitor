@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""otop — live terminal dashboard for local Ollama.
+"""otop — live terminal dashboard for Ollama and OpenAI-compatible servers.
 
 Shows, refreshed in real time:
   * output tokens / prompt tokens / tok/s per request and session totals
-    (via a transparent proxy: point your client at --proxy-port instead of 11434)
+    (via a transparent proxy: point your client at --proxy-port instead of the server)
   * CPU usage and thread count of the ollama server + model runner processes
   * system CPU (overall + per-core), load average, RAM
   * Apple Silicon GPU utilization and GPU memory (via ioreg, no sudo)
@@ -13,21 +13,30 @@ Usage:
     python otop.py                     # dashboard + proxy on :11435
     python otop.py --no-proxy          # dashboard only
     python otop.py --proxy-port 9999   # custom proxy port
+    python otop.py --upstream http://192.168.0.23:8080/v1 --api-key SECRET
 
-Then send traffic through the proxy to get live token counts:
+Send traffic through the proxy to get live token counts:
     OLLAMA_HOST=127.0.0.1:11435 ollama run llama3.2
     curl http://127.0.0.1:11435/api/generate -d '{"model":"...","prompt":"..."}'
+
+Cline / any OpenAI-compatible client (the proxy injects the real api key, so
+Cline's own key field can be any placeholder):
+    ./otop.sh --upstream http://192.168.0.23:8080/v1 --api-key "$(cat key.txt)"
+    # then in Cline settings:  openaiBaseUrl = http://127.0.0.1:11435/v1
 """
 
 import argparse
 import asyncio
 import json
+import os
 import re
 import subprocess
 import sys
 import time
+import zlib
 from collections import deque
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 import psutil
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
@@ -88,6 +97,10 @@ class State:
         self.cpu_percent = 0.0
         self.per_core = []
         self.proxy_error = ""
+        self.upstream_label = ""       # upstream base url shown in the header
+        self.upstream_mode = ""        # "ollama" (native api) or "openai" (compatible)
+        self.poll_error = ""           # why the model poll failed, e.g. "401 for /v1/models"
+        self.api_key_set = False       # --api-key injected into upstream requests
 
     def new_request(self, model: str, path: str) -> RequestStats:
         r = RequestStats(self.next_id, model, path, time.time())
@@ -108,7 +121,74 @@ STATE = State()
 # ---------------------------------------------------------------- proxy
 
 STREAM_PATHS = ("/api/generate", "/api/chat", "/v1/chat/completions", "/v1/completions")
+STREAM_SUFFIXES = ("/chat/completions", "/completions", "/api/chat", "/api/generate")
+OPENAI_SUFFIXES = ("/chat/completions", "/completions", "/embeddings", "/models", "/responses")
 HOP_HEADERS = {"transfer-encoding", "content-length", "connection", "keep-alive", "host"}
+AUTH_HEADERS = {"authorization", "x-api-key", "api-key"}
+
+
+@dataclass
+class Upstream:
+    """A base url split into what a proxy request path has to be mapped onto.
+
+    root = "http://host:port"        (native ollama /api/* endpoints live here)
+    base = "/v1" or ""               (path prefix the OpenAI-compatible server serves)
+    """
+    root: str
+    base: str
+    api_key: str = ""
+    key_headers: tuple = ("authorization",)
+    label: str = ""
+
+
+def _split_upstream(url: str) -> tuple[str, str]:
+    """("http://192.168.0.23:8080", "/v1") for http://192.168.0.23:8080/v1."""
+    url = url.strip()
+    if not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", url):
+        url = "http://" + url
+    p = urlsplit(url.rstrip("/"))
+    return f"{p.scheme}://{p.netloc}", p.path.rstrip("/")
+
+
+def _endpoint(path: str, base: str) -> str:
+    """The path the upstream actually serves, i.e. with the base prefix stripped."""
+    if base and (path == base or path.startswith(base + "/")):
+        return path[len(base):]
+    return path
+
+
+def _target_url(path: str, up: Upstream) -> str:
+    """Absolute upstream url for a proxied request path.
+
+    base "/v1":  /v1/chat/completions -> root/v1/chat/completions
+                 /chat/completions    -> root/v1/chat/completions  (client skipped /v1)
+                 /api/ps              -> root/api/ps               (native endpoint)
+    no base:     everything is just appended to the root.
+    """
+    ep = _endpoint(path, up.base)
+    if ep != path:
+        return up.root + path
+    if up.base and any(ep.endswith(s) for s in OPENAI_SUFFIXES):
+        return up.root + up.base + ep
+    return up.root + ep
+
+
+def _is_stream_path(path: str, base: str) -> bool:
+    ep = _endpoint(path, base)
+    return ep in STREAM_PATHS or any(ep.endswith(s) for s in STREAM_SUFFIXES)
+
+
+def _auth_headers(key: str, key_headers: tuple) -> dict:
+    """Auth headers we send upstream: Bearer for `authorization`, bare for the rest.
+
+    Shared by the proxy and by the dashboard pollers, so `--api-key-header x-api-key`
+    / `both` also decides how /api/ps and /v1/models are authenticated.
+    """
+    out = {}
+    if key:
+        for h in key_headers:
+            out[h] = f"Bearer {key}" if h == "authorization" else key
+    return out
 
 
 def _extract_model(body: bytes) -> str:
@@ -116,6 +196,18 @@ def _extract_model(body: bytes) -> str:
         return json.loads(body).get("model", "?")
     except Exception:
         return "?"
+
+
+def _body_wants_stream(body: bytes) -> bool:
+    """True when the request asked for a streamed response ("stream": true).
+
+    Needed because llama.cpp / vLLM / some ollama builds answer SSE bodies with
+    Content-Type: application/json, so the response header alone is not reliable.
+    """
+    try:
+        return bool(json.loads(body).get("stream", False))
+    except Exception:
+        return b'"stream"' in body
 
 
 def _count_ndjson_line(line: bytes, r: RequestStats):
@@ -191,42 +283,111 @@ def _count_final_json(body: bytes, r: RequestStats):
     STATE.total_prompt += r.prompt_tokens
 
 
-async def proxy_handler(request: web.Request, upstream: str, session: ClientSession):
-    body = await request.read()
-    track = request.path in STREAM_PATHS and request.method == "POST"
-    r = STATE.new_request(_extract_model(body), request.path) if track else None
+class _Inflator:
+    """Incrementally inflate a gzip/deflate response body for token counting only.
 
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_HEADERS}
+    The bytes written back to the client are never touched (still compressed, with
+    Content-Encoding intact). Counting is best-effort: if inflation fails we stop
+    counting that response, the passthrough keeps working.
+    """
+    def __init__(self, enc: str):
+        self.enc = enc
+        self.obj = None
+        self.pending = b""
+        self.broken = False
+
+    def feed(self, chunk: bytes) -> bytes:
+        if self.broken:
+            return b""
+        try:
+            data = self.pending + chunk
+            self.pending = b""
+            if self.obj is None:
+                if self.enc == "gzip":
+                    if len(data) < 10:
+                        self.pending = data
+                        return b""
+                    data = data[10:]          # skip the gzip header
+                    self.obj = zlib.decompressobj(-zlib.MAX_WBITS)
+                elif data[:1] == b"\x78":     # zlib-wrapped deflate
+                    self.obj = zlib.decompressobj()
+                else:
+                    self.obj = zlib.decompressobj(-zlib.MAX_WBITS)
+            return self.obj.decompress(data)
+        except Exception:
+            self.broken = True
+            return b""
+
+
+def _count_response(body: bytes, r: RequestStats):
+    """Whole response body: SSE lines (mislabelled streams) or one final json blob."""
+    if b"\ndata:" in body or body.lstrip().startswith(b"data:"):
+        for line in body.split(b"\n"):
+            if line.strip():
+                _count_sse_line(line.strip(), r)
+        if not r.done:
+            r.done, r.ended = True, time.time()
+        return
+    _count_final_json(body, r)
+
+async def proxy_handler(request: web.Request, up: Upstream, session: ClientSession):
+    body = await request.read()
+    path = request.path
+    track = request.method == "POST" and _is_stream_path(path, up.base)
+    r = STATE.new_request(_extract_model(body), path) if track else None
+
+    # drop hop-by-hop headers, and any client auth we are meant to replace
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in HOP_HEADERS
+               and not (up.api_key and k.lower() in AUTH_HEADERS)}
+    headers.update(_auth_headers(up.api_key, up.key_headers))
+
+    target = _target_url(path, up)
+    if request.url.query:
+        target += request.url.query
     try:
-        async with session.request(
-            request.method, upstream + request.path_qs, data=body or None, headers=headers
-        ) as up:
-            ctype = up.headers.get("Content-Type", "")
-            streaming = "ndjson" in ctype or "event-stream" in ctype
-            resp = web.StreamResponse(status=up.status)
-            for k, v in up.headers.items():
+        async with session.request(request.method, target, data=body or None,
+                                   headers=headers) as upstream:
+            ctype = upstream.headers.get("Content-Type", "")
+            enc = (upstream.headers.get("Content-Encoding") or "").lower()
+            # trust the request's "stream" flag too: llama.cpp / vLLM answer SSE with
+            # Content-Type: application/json
+            streaming = ("ndjson" in ctype or "event-stream" in ctype
+                         or _body_wants_stream(body))
+            resp = web.StreamResponse(status=upstream.status)
+            for k, v in upstream.headers.items():
                 if k.lower() not in HOP_HEADERS:
                     resp.headers[k] = v
             await resp.prepare(request)
 
             if streaming and r:
-                counter = _count_sse_line if "event-stream" in ctype else _count_ndjson_line
+                counter = None
+                inflator = _Inflator(enc) if enc in ("gzip", "deflate") else None
                 buf = b""
-                async for chunk in up.content.iter_any():
-                    await resp.write(chunk)
+                async for chunk in upstream.content.iter_any():
+                    await resp.write(chunk)          # forward first, count after
+                    if inflator:
+                        chunk = inflator.feed(chunk)
+                        if not chunk:
+                            continue
                     buf += chunk
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
-                        if line.strip():
-                            counter(line.strip(), r)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if counter is None:  # sniff once: SSE vs NDJSON
+                            counter = (_count_sse_line
+                                       if line.startswith(b"data:") else _count_ndjson_line)
+                        counter(line, r)
             else:
                 collected = b""
-                async for chunk in up.content.iter_any():
+                async for chunk in upstream.content.iter_any():
                     await resp.write(chunk)
                     if r:
                         collected += chunk
                 if r:
-                    _count_final_json(collected, r)
+                    _count_response(collected, r)
 
             await resp.write_eof()
             if r and not r.done:
@@ -240,7 +401,7 @@ async def proxy_handler(request: web.Request, upstream: str, session: ClientSess
         return web.json_response({"error": f"otop proxy: {e}"}, status=502)
 
 
-async def start_proxy(port: int, upstream: str):
+async def start_proxy(port: int, host: str, up: Upstream):
     session = ClientSession(
         timeout=ClientTimeout(total=None, sock_connect=5),
         connector=TCPConnector(limit=100),
@@ -248,14 +409,14 @@ async def start_proxy(port: int, upstream: str):
     )
     app = web.Application(client_max_size=512 * 1024 * 1024)
     app.router.add_route(
-        "*", "/{tail:.*}", lambda req: proxy_handler(req, upstream, session)
+        "*", "/{tail:.*}", lambda req: proxy_handler(req, up, session)
     )
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     try:
-        await web.TCPSite(runner, "127.0.0.1", port).start()
+        await web.TCPSite(runner, host, port).start()
     except OSError as e:
-        STATE.proxy_error = f"proxy failed to bind :{port} ({e.strerror})"
+        STATE.proxy_error = f"proxy failed to bind {host}:{port} ({e.strerror})"
     return runner, session
 
 # ---------------------------------------------------------------- collectors
@@ -333,19 +494,56 @@ async def poll_procs():
         await asyncio.sleep(1.0)
 
 
-async def poll_ollama(upstream: str):
-    async with ClientSession(timeout=ClientTimeout(total=3)) as s:
+async def poll_ollama(root: str, base: str, api_key: str):
+    """Loaded models + version. Native ollama first, OpenAI-compatible fallback."""
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    async with ClientSession(timeout=ClientTimeout(total=3), headers=headers) as s:
         while True:
+            models, version, err = None, None, ""
             try:
-                async with s.get(upstream + "/api/ps") as resp:
-                    STATE.models = (await resp.json()).get("models", [])
-                    STATE.ollama_ok = True
-                if not STATE.ollama_version:
-                    async with s.get(upstream + "/api/version") as resp:
-                        STATE.ollama_version = (await resp.json()).get("version", "?")
+                async with s.get(root + "/api/ps") as resp:
+                    if resp.status == 200:
+                        models = (await resp.json()).get("models", [])
+                    else:
+                        err = f"{resp.status} for /api/ps"
             except Exception:
-                STATE.ollama_ok = False
-                STATE.models = []
+                err = "unreachable"
+            if models is not None:
+                try:
+                    async with s.get(root + "/api/version") as resp:
+                        if resp.status == 200:
+                            version = (await resp.json()).get("version", "?")
+                except Exception:
+                    pass
+                STATE.models = models
+                STATE.ollama_ok = True
+                STATE.upstream_mode = "ollama"
+                STATE.ollama_version = version or STATE.ollama_version
+                STATE.poll_error = ""
+                await asyncio.sleep(1.5)
+                continue
+            # not ollama (or /api/ps missing/unauthorized): ask the OpenAI server
+            if base:
+                try:
+                    async with s.get(root + base + "/models") as resp:
+                        if resp.status == 200:
+                            models = [(m.get("id") or m.get("model") or "?")
+                                      for m in (await resp.json()).get("data", [])]
+                        else:
+                            err = f"{resp.status} for {base}/models"
+                except Exception:
+                    err = "unreachable"
+                if models is not None:
+                    STATE.models = [{"name": n} for n in models]
+                    STATE.ollama_ok = True
+                    STATE.upstream_mode = "openai"
+                    STATE.poll_error = ""
+                    await asyncio.sleep(1.5)
+                    continue
+            STATE.ollama_ok = False
+            STATE.models = []
+            STATE.upstream_mode = ""
+            STATE.poll_error = err
             await asyncio.sleep(1.5)
 
 
@@ -357,7 +555,7 @@ async def poll_tps_history():
 # ---------------------------------------------------------------- rendering
 
 def fmt_bytes(n):
-    if n is None:
+    if not n:
         return "–"
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
@@ -393,10 +591,19 @@ def render_header(proxy_port, no_proxy):
     status = Text()
     if STATE.ollama_ok:
         status.append(" ● ", style="bold green")
-        status.append(f"ollama {STATE.ollama_version}  ")
+        mode = STATE.upstream_mode or "upstream"
+        status.append(f"{mode} {STATE.ollama_version}  "
+                      if STATE.ollama_version else f"{mode}  ")
     else:
         status.append(" ● ", style="bold red")
-        status.append("ollama unreachable  ")
+        if STATE.poll_error:
+            status.append(f"{STATE.poll_error}  ", style="yellow")
+        else:
+            status.append("upstream unreachable  ")
+    if STATE.upstream_label:
+        status.append(f"{STATE.upstream_label}  ", style="dim")
+    if STATE.api_key_set:
+        status.append("api key ✓  ", style="green")
     if no_proxy:
         status.append("proxy off", style="dim")
     elif STATE.proxy_error:
@@ -510,9 +717,9 @@ def render_models():
         tbl.add_column(col, justify=j)
     now = time.time()
     for m in STATE.models:
-        size, vram = m.get("size", 0), m.get("size_vram", 0)
-        gpu_pct = round(vram / size * 100) if size else 0
-        placement = f"{gpu_pct}% GPU" if gpu_pct else "100% CPU"
+        size, vram = m.get("size") or 0, m.get("size_vram") or 0
+        gpu_pct = round(vram / size * 100) if size else None
+        placement = (f"{gpu_pct}% GPU" if gpu_pct else "100% CPU") if size else "–"
         expires = "–"
         try:
             from datetime import datetime
@@ -526,7 +733,8 @@ def render_models():
         tbl.add_row(
             Text(m.get("name", "?"), style="bold"),
             fmt_bytes(size), fmt_bytes(vram),
-            Text(placement, style="green" if gpu_pct >= 100 else "yellow"),
+            Text(placement, style="green" if (gpu_pct or 0) >= 100
+                 else "dim" if gpu_pct is None else "yellow"),
             str(m.get("context_length", "–")),
             Text(expires, style="dim"),
         )
@@ -549,25 +757,43 @@ def render(proxy_port, no_proxy):
 # ---------------------------------------------------------------- main
 
 async def main():
-    ap = argparse.ArgumentParser(description="live ollama monitor")
+    ap = argparse.ArgumentParser(description="live ollama / openai-compatible monitor")
     ap.add_argument("--upstream", default="http://127.0.0.1:11434",
-                    help="ollama server url (default: %(default)s)")
+                    help="upstream base url, may carry a path prefix "
+                         "(e.g. http://192.168.0.23:8080/v1) (default: %(default)s)")
+    ap.add_argument("--api-key",
+                    default=os.environ.get("OTOP_API_KEY") or os.environ.get("OPENAI_API_KEY") or "",
+                    help="api key injected into every upstream request "
+                         "(default: $OTOP_API_KEY / $OPENAI_API_KEY)")
+    ap.add_argument("--api-key-header", choices=("authorization", "x-api-key", "both"),
+                    default="authorization",
+                    help="header(s) used to send --api-key upstream (default: %(default)s)")
     ap.add_argument("--proxy-port", type=int, default=11435,
                     help="token-counting proxy port (default: %(default)s)")
+    ap.add_argument("--proxy-host", default="127.0.0.1",
+                    help="proxy bind address (default: %(default)s)")
     ap.add_argument("--no-proxy", action="store_true", help="disable the proxy")
     ap.add_argument("--refresh", type=float, default=4.0,
                     help="ui refreshes per second (default: %(default)s)")
     args = ap.parse_args()
 
+    root, base = _split_upstream(args.upstream)
+    key_headers = {"authorization": ("authorization",),
+                   "x-api-key": ("x-api-key",),
+                   "both": ("authorization", "x-api-key")}[args.api_key_header]
+    up = Upstream(root, base, args.api_key, key_headers, f"{root}{base}")
+    STATE.upstream_label = up.label
+    STATE.api_key_set = bool(args.api_key)
+
     tasks = [
         asyncio.create_task(poll_gpu()),
         asyncio.create_task(poll_procs()),
-        asyncio.create_task(poll_ollama(args.upstream)),
+        asyncio.create_task(poll_ollama(root, base, args.api_key)),
         asyncio.create_task(poll_tps_history()),
     ]
     runner = session = None
     if not args.no_proxy:
-        runner, session = await start_proxy(args.proxy_port, args.upstream)
+        runner, session = await start_proxy(args.proxy_port, args.proxy_host, up)
 
     console = Console()
     try:
